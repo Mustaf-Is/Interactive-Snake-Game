@@ -29,7 +29,7 @@ Open the local URL printed by the server. If the system npm shim fails, invoke i
 
 Started runs count toward games played, even if a browser is closed before completion; history marks these as unfinished. Completed runs store difficulty, score, length, food eaten, active play duration, and timestamps. Failed saves remain in the current page with a Retry button; reloading that page discards the unsaved replay. There is no browser-storage score database.
 
-The hosted app is owner-private. The database is shared across this private app; individual player accounts and public leaderboards are outside this version. Do not make the app public without adding identity isolation and rate limits. Replay validation prevents arbitrary submitted score values; it does not prevent scripted play. Replay limits are 100,000 ticks and 20,000 direction events.
+As verified on 2026-09-13, the hosted app is public at [snake-97.ismajlim26.chatgpt.site](https://snake-97.ismajlim26.chatgpt.site). All visitors share the same history, best score, and games-played count; individual player records and application rate limits are not implemented. Replay validation prevents arbitrary submitted score values; it does not prevent scripted play. Replay limits are 100,000 ticks and 20,000 direction events. Recheck Sites for the current audience before changing access or deploying.
 
 ## Verify
 
@@ -47,3 +47,5 @@ Optional WebMCP tools expose current game status and pausing through the same UI
 ## Hosting
 
 The Sites identity and logical D1 binding are in `.openai/hosting.json`. A production build emits the Worker under `dist/server`, client assets under `dist/client`, and the database migrations under `dist/.openai`. Local D1 state is separate from the hosted database and is ignored by Git.
+
+See [AGENTS.md](AGENTS.md) for the repository map, implementation rules, configuration, API contract, deployment workflow, and known limitations for future contributors and AI agents. GitHub `origin` hosts the source; pushing there does not automatically publish to Sites.
