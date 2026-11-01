@@ -64,7 +64,16 @@ for (const [name, payload] of Object.entries({
   'unfinished run': {ticks: 1, turns: []},
   'continued after collision': {...replay(false).payload, ticks: replay(false).payload.ticks + 1},
 })) test(`rejects ${name}`, async () => {
-  assert.equal((await finish(payload)).status, 400);
+  const response = await finish(payload);
+  assert.equal(response.status, 400);
+  const expected = {
+    'out-of-order turns': 'Invalid turn sequence.',
+    'duplicate turn ticks': 'Invalid turn sequence.',
+    'turn after final tick': 'Invalid turn sequence.',
+    'unfinished run': 'This game has not ended.',
+    'continued after collision': 'Replay continued after game over.',
+  }[name] ?? 'Invalid game replay.';
+  assert.equal((await response.json()).error, expected);
   assert.equal((await db.prepare('SELECT status FROM games WHERE id = ?').bind(id).first()).status, 'started');
 });
 
@@ -143,6 +152,22 @@ test('save persists the replay and repeated completion returns stored score', as
   assert.ok(row.completed_at > 0);
   assert.equal((await db.prepare('SELECT COUNT(*) AS n FROM games').first()).n, 1);
 });
+test('simultaneous duplicate completions persist one run and one global score', async () => {
+  const run = replay(true);
+  const responses = await Promise.all(Array.from({length: 3}, () => finish(run.payload)));
+  for (const response of responses) {
+    assert.equal(response.status, 200);
+    assert.deepEqual(await response.json(), {saved: true, score: run.score});
+  }
+  const response = await api.GET();
+  assert.equal(response.status, 200);
+  const stats = await response.json();
+  assert.equal(stats.played, 1);
+  assert.equal(stats.best, run.score);
+  assert.equal(stats.top.length, 1);
+  assert.equal(stats.top[0].id, id);
+  assert.equal(stats.recent[0].status, 'completed');
+});
 test('simultaneous different completions both return the canonical stored result', async () => {
   // Hold both initial reads until each has observed started. The writes still
   // execute against real D1, reproducing the losing conditional update.
@@ -170,5 +195,3 @@ test('simultaneous different completions both return the canonical stored result
     assert.deepEqual(await response.json(), {saved: true, score: canonical});
   }
 });
-
-
