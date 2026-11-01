@@ -14,3 +14,9 @@ export const games = sqliteTable('games', {
   index('idx_games_created_at').on(table.createdAt),
   index('idx_games_status_score_created_at').on(table.status, table.score, table.createdAt),
 ]);
+
+export const rateLimits = sqliteTable('rate_limits', {
+  key: text('key').primaryKey(),
+  windowStart: integer('window_start').notNull(),
+  count: integer('count').notNull(),
+}, table => [index('idx_rate_limits_window').on(table.windowStart)]);
