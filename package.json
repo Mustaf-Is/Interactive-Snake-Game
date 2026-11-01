@@ -6,6 +6,10 @@
     "node": ">=22.13.0"
   },
   "scripts": {
+    "test": "node --experimental-strip-types --test tests/snake.test.mjs tests/api.test.mjs",
+    "typecheck": "tsc --noEmit",
+    "test:browser": "playwright test",
+    "verify": "node scripts/verify.mjs",
     "install:ci": "node scripts/install-ci.mjs",
     "dev": "node scripts/run-framework.mjs dev",
     "build": "node scripts/run-framework.mjs build",

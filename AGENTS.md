@@ -14,7 +14,7 @@ Deployment and repository snapshot verified on **2026-09-13**:
 - Latest saved Sites version: **1**, built from `5721a5006421092e5c3490775d076e303bc5f13b`.
 - GitHub `origin`: `https://github.com/Mustaf-Is/Interactive-Snake-Game.git`.
 - Current local branch: `master`, tracking `origin/master`. Check `git branch -vv` and `git remote -v` before relying on this snapshot.
-- No GitHub Actions deployment workflow, Netlify configuration, or GitHub Pages deployment is configured in the tracked source.
+- GitHub Actions verification runs `npm run verify` on pushes/PRs. There is no automated deployment, Netlify configuration, or GitHub Pages deployment in the tracked source.
 - GitHub source hosting and Sites production hosting are separate. A push to GitHub is not a Sites deployment.
 
 The original deployment was private and used another slug. Do not restore that old audience or URL from conversation history. External state and current user instructions take precedence over this snapshot.
@@ -62,7 +62,7 @@ Preserve the lockfile and existing package manager. The starter includes more UI
 - `app/layout.tsx`: document metadata, global stylesheet, favicon. It currently also contains the `codex-preview: development` metadata marker.
 - `public/favicon.svg`: game favicon. Other small SVGs in `public/` are unused starter assets.
 - `lib/snake.ts`: pure shared simulation and difficulty definitions; imported by both browser and server. `lib/utils.ts` contains UI utilities.
-- `app/api/games/route.ts`: all game API methods; dynamic responses with `Cache-Control: no-store`.
+- `app/api/games/route.ts`: binds the handlers from `lib/game-api.ts` to D1; dynamic responses with `Cache-Control: no-store`.
 - `db/index.ts`: server-only binding access via `env` from `cloudflare:workers`. `getSql()` returns raw D1; `getDb()` is the available Drizzle wrapper.
 - `db/schema.ts`, `drizzle.config.ts`, `drizzle/`: schema, migration configuration, SQL and migration metadata.
 - `vite.config.ts`: Vinext, Sites, and Cloudflare plugins plus logical local bindings.
@@ -71,7 +71,8 @@ Preserve the lockfile and existing package manager. The starter includes more UI
 - `scripts/`: installation, execution profile, environment and build/dev wrappers.
 - `app/chatgpt-auth.ts`: available server-side ChatGPT identity/sign-in helpers, currently unused by the game routes.
 - `components/ui/`, `hooks/`, `vendor/`: supplied UI primitives/helpers and licensed assets. Compose primitives rather than editing vendored implementations for a one-off style change.
-- `tests/snake.test.mjs`: six engine tests. `tests/api-smoke.mjs`: local HTTP/database smoke check.
+- `tests/snake.test.mjs`: six engine tests. `tests/api.test.mjs`: isolated real-D1 handler tests, including races and failures. `tests/api-smoke.mjs`: local HTTP/database smoke check. `tests/browser/game.spec.ts`: desktop/phone Playwright journeys.
+- `lib/rate-limit.ts`: shared D1 write budgets. `scripts/verify.mjs`: full verification. `scripts/e2e-server.mjs`: fresh migrated browser-test storage on port 4173.
 - `examples/d1/`: starter examples, not live routes; excluded from TypeScript checking. Do not modify these instead of the real application.
 - `README.md`: human-facing play, setup and verification guide.
 
@@ -85,19 +86,21 @@ The run lifecycle:
 2. The browser initializes from that seed and simulates locally. It logs consumed turns as `{ tick, direction }`, with one-based tick numbers. No per-tick network request is made.
 3. On collision or victory, `PUT /api/games` sends exactly `{ id, ticks, turns }`. Do not submit a score or trust a client-calculated score.
 4. The server loads the original seed and difficulty, replays the run with the same engine, verifies its end, calculates score/length/food/duration, and updates the row to `completed`.
-5. A repeat completion request for an already completed ID returns the saved score without inserting another row. UI reloads statistics after successful completion.
+5. After the conditional update, the handler reads the canonical stored result; losing concurrent requests return the winning score. A repeat completion request for an already completed ID returns the saved score without inserting another row. UI reloads statistics after successful completion.
 
 `GET /api/games` returns `{ played, best, food, recent, top }`. `played` counts **all started rows**, including abandoned runs. `best` is the maximum stored score across difficulties; `food` sums stored food. `recent` returns the five newest starts; `top` returns five completed runs ordered by score descending, then creation time descending. Returned run fields are `id`, `difficulty`, `score`, `length`, `duration_ms`, `created_at`, and `status`.
 
 Validation and errors:
 
-- Invalid input/replay: 400; mismatched supplied Origin: 403; unknown completion ID: 404; database failure: 503; successful read/save: 200.
-- The route checks a supplied Origin against the request URL origin, but permits requests with no Origin. This is not authentication or rate limiting. Cross-origin frontend hosting is not currently configured.
+- Invalid input/replay: 400; mismatched supplied Origin: 403; unknown completion ID: 404; rate limit: 429 (with `Retry-After`); database failure: 503; successful read/save: 200.
+- The route checks a supplied Origin against the request URL origin, but permits requests with no Origin. This is not authentication. Separate D1 write limits apply before parsing/replay: 12 starts and 30 submissions per 60-second fixed window per trusted `CF-Connecting-IP`. Missing headers share one fallback budget. Digests rotate each window; raw addresses are not stored. Expired counters are removed on writes. D1 UPSERTs enforce budgets across concurrent instances; shared networks share a budget and the limiter itself still consumes D1 operations. Cross-origin frontend hosting is not currently configured.
 - Request text is capped at **1,000,000 characters after reading it**. Replay permits **100,000 ticks** and **20,000 turns**; turn ticks must strictly increase and cannot exceed the final tick.
 - Replays must end exactly at game over; continuing after game over or submitting an unfinished run is rejected. Simulated time cannot exceed time since server-side creation by more than **1,500 ms**.
 - Zod schemas reject extra fields. Database errors are logged server-side, while responses give a recoverable generic message.
 
 The `games` table has ten columns: `id` (text primary key), `seed`, `difficulty`, `status`, `score` (default 0), `length` (default 4), `food` (default 0), `duration_ms` (default 0), `created_at`, and nullable `completed_at`. Timestamps are epoch milliseconds. Indexes cover `created_at` and `(status, score, created_at)`.
+
+The separate `rate_limits` table stores `key`, `window_start`, and `count`, with an index on `window_start`. Migration `0001_bouncy_banshee.sql` adds it without changing game records.
 
 There is no user ID column, persisted turn log, account system, deletion API, pagination, or ongoing-run recovery. Finished game summaries are durable; active gameplay and unsaved replays are not.
 
@@ -116,6 +119,7 @@ Before the first local database use, apply the initial migration **once**:
 
 ```sh
 node --import ./scripts/sites-env.mjs ./node_modules/wrangler/bin/wrangler.js d1 execute DB --local --config dist/server/wrangler.json --persist-to .wrangler/state --file drizzle/0000_loud_santa_claus.sql
+node --import ./scripts/sites-env.mjs ./node_modules/wrangler/bin/wrangler.js d1 execute DB --local --config dist/server/wrangler.json --persist-to .wrangler/state --file drizzle/0001_bouncy_banshee.sql
 npm run dev
 ```
 
@@ -152,9 +156,8 @@ Use one SQL statement per D1 `prepare()` and bind values. Batch related statemen
 ## Testing and verification
 
 ```sh
-node --experimental-strip-types --test tests/snake.test.mjs
-node node_modules/typescript/bin/tsc --noEmit
-npm run build
+npx playwright install chromium
+npm run verify
 ```
 
 With a running local server and migrated D1 database:
@@ -163,9 +166,9 @@ With a running local server and migrated D1 database:
 node --experimental-strip-types tests/api-smoke.mjs
 ```
 
-There is no `npm test` script. `npm run lint` exists but is separate from build/type checking; do not claim it passed without running it.
+`npm run verify` runs engine/API tests, type checking, zero-warning linting, build, and Playwright. GitHub Actions uses the same command. `npm test`, `npm run typecheck`, `npm run lint`, and `npm run test:browser` are available separately; browser tests require a current build. The API suite creates an in-memory Miniflare D1 database and applies every migration. Browser tests start a built Worker on port 4173 with fresh storage under ignored `.wrangler/e2e/`, leaving development state intact; databases remain there for inspection. Traces are retained on failure.
 
-Engine tests cover seeded food, growth and immutable previous state, speed changes/caps, reverse-turn rejection, wall/body collision, legal tail-cell movement, and board-fill victory. The API smoke test creates one real **local** run and checks invalid difficulty, a food-eating replay, rejection of score tampering and unfinished replay, persistence, duplicate completion, and statistics. It waits for simulation duration before saving. It defaults to `http://localhost:5173`; `SNAKE_TEST_URL` can change the URL but the script rejects non-localhost/non-127.0.0.1 hosts. Run it without concurrent game starts, since it asserts an exact count increase and membership in the top five. Existing high local scores can make that top-five assertion fail independently of saving correctness.
+Engine tests cover seeded food, growth and immutable previous state, speed changes/caps, reverse-turn rejection, wall/body collision, legal tail-cell movement, and board-fill victory. The API smoke test creates one real **local** run and checks invalid difficulty, a food-eating replay, rejection of score tampering and unfinished replay, persistence, duplicate completion, and statistics. It waits for simulation duration before saving. It defaults to `http://localhost:5173`; `SNAKE_TEST_URL` can change the URL but the script rejects non-localhost/non-127.0.0.1 hosts. It allows concurrent starts and verifies its exact persisted score through idempotent completion rather than leaderboard membership. The browser suite runs it with five higher fixture scores already stored. API tests additionally cover unknown IDs, validation caps, turn ordering, post-game ticks, database failures/write recovery, conflicting concurrent completions, and concurrent rate budgets. Browser journeys exercise controls, pause/resume, focus loss, save/retry, persistence and responsive layout on desktop and phone.
 
 For gameplay/UI changes, also check start, WASD and arrows, pause/resume, focus-loss pause, difficulty locking, game-over save, failed-save retry, and score history after reload. Check desktop and phone widths (for example 1440 px and 390 px), visible touch controls, focus indicators and reduced motion. Do not run write tests against production by replacing the smoke test's hostname guard. Documentation-only changes need document/path/config verification, not an app deployment or a new game test run.
 
@@ -204,8 +207,8 @@ A failed deployment can have applied migrations before Worker upload failed. Det
 ## Sharing, portability and limitations
 
 - The game is currently public. Sharing permissions only control who can visit; they do not create player ownership inside the application.
-- **All visitors share one database history, best score and games-played count.** The UI's “personal best” is currently site-wide. There are no player names, player-specific records or authenticated write checks in the game route.
-- Replay validation prevents simply submitting an arbitrary score, but does not prevent bots or prove a person played. There is no application rate limit. An unknown client can call the public API; Origin validation and random run IDs are not substitutes for authorization.
+- **All visitors share one database history, best score and games-played count.** The UI labels records, best score, and starts as global. There are no player names, player-specific records or authenticated write checks in the game route.
+- Replay validation prevents simply submitting an arbitrary score, but does not prevent bots or prove a person played. Basic per-address D1 write limits apply; there is no edge-level flood protection. An unknown client can call the public API; Origin validation and random run IDs are not substitutes for authorization.
 - For work adding individual records, use a stable server-verified identity and ownership checks, migrate existing shared records deliberately, and update read/write queries together. Existing `app/chatgpt-auth.ts` helpers are not already wired into this flow.
 - Sites owns `/signin-with-chatgpt`, `/signout-with-chatgpt`, and `/callback`. The portable preview plugin can mock sign-in on loopback for a fixed local user; that is not production identity or authorization. Do not import the server auth helper into the client bundle or implement replacement reserved routes casually.
 - There is no offline mode. Starting requires a successful server insert. Closing/reloading loses a pending replay; its started database row remains unfinished. There is no abandonment cleanup or resumed-game endpoint.
@@ -220,6 +223,6 @@ A failed deployment can have applied migrations before Worker upload failed. Det
 - Start with `git status --short`, inspect relevant files, and preserve unrelated changes. If creating a new branch without a user-specified name, use `codex/` as the prefix; do not rename the existing branch gratuitously.
 - Keep the pure engine shared by server and browser. Never duplicate scoring/random-food logic or replace durable score storage with browser storage as a shortcut.
 - Use the existing theme and accessible primitives. Keep play available directly on the main screen. Avoid unnecessary packages, routes, account flows, or broad UI rewrites.
-- For tuning gameplay: begin at `lib/snake.ts`, then the HUD/input logic and engine tests. For scores/history: begin at the API, schema and API smoke test. For layout: begin at `app/snake-game.tsx` and `app/globals.css`. For hosting: begin at the manifest, Vite config and script wrappers.
+- For tuning gameplay: begin at `lib/snake.ts`, then the HUD/input logic and engine tests. For scores/history: begin at `lib/game-api.ts`, the API binding, schema and API smoke test. For layout: begin at `app/snake-game.tsx` and `app/globals.css`. For hosting: begin at the manifest, Vite config and script wrappers.
 - Keep `.wrangler/`, `.sites-runtime/`, `dist/`, `node_modules/`, `.vinext/`, `.next/`, `.env*` and `*.tsbuildinfo` out of Git. Do not inspect or publish credentials as project documentation. Preserve license files accompanying vendored code.
 - Report what changed, what was actually checked, and any remaining limitations. Recheck live settings before documenting them as current; update this guide when architecture, commands, storage, URLs or deployment arrangements change.
