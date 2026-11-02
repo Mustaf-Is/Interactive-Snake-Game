@@ -5,12 +5,14 @@ import { Miniflare } from 'miniflare';
 import { createGameApi } from '../lib/game-api.ts';
 import { newGame, step } from '../lib/snake.ts';
 import { limitWrite, WRITE_LIMITS } from '../lib/rate-limit.ts';
+import { guestSession } from '../lib/player-session.ts';
 
 const runtime = new Miniflare({ cf: false, modules: true, script: 'export default {fetch(){return new Response()}}', compatibilityDate: '2026-05-22', d1Databases: ['DB'] });
 let db;
 let api;
 const id = '00000000-0000-4000-8000-000000000001';
-const request = (method, payload) => new Request('http://localhost/api/games', { method, headers: {'Content-Type': 'application/json'}, body: method === 'GET' ? undefined : JSON.stringify(payload) });
+let cookie = '';
+const request = (method, payload) => new Request('http://localhost/api/games', { method, headers: {'Content-Type': 'application/json', Cookie: cookie}, body: method === 'GET' ? undefined : JSON.stringify(payload) });
 const finish = (payload, handler = api.PUT) => handler(request('PUT', { id, ...payload }));
 
 before(async () => {
@@ -24,7 +26,10 @@ beforeEach(async () => {
   await db.prepare('DELETE FROM games').run();
   await db.prepare('DELETE FROM rate_limits').run();
   api = createGameApi(() => db);
-  await db.prepare("INSERT INTO games (id, seed, difficulty, status, created_at) VALUES (?, 97, 'easy', 'started', ?)").bind(id, Date.now() - 100000).run();
+  cookie = '';
+  const session = await guestSession(db, request('GET'));
+  cookie = session.cookie.split(';')[0];
+  await db.prepare("INSERT INTO games (id, seed, difficulty, status, created_at, player_id, player_name) VALUES (?, 97, 'easy', 'started', ?, ?, ?)").bind(id, Date.now() - 100000, session.player.id, session.player.username).run();
 });
 
 function replay(eat) {
@@ -105,7 +110,8 @@ test('database failures return recoverable 503 responses', async t => {
   }
 });
 test('write limits enforce separate atomic budgets across API instances', async t => {
-  t.mock.method(Date, 'now', () => 60001);
+  const now = Date.now();
+  t.mock.method(Date, 'now', () => now);
   const apis = [createGameApi(() => db), createGameApi(() => db)];
   const starts = await Promise.all(Array.from({length: 20}, (_, i) => apis[i % 2].POST(request('POST', {difficulty: 'easy'}))));
   assert.equal(starts.filter(r => r.status === 201).length, WRITE_LIMITS.start);

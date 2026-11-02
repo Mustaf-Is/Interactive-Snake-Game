@@ -4,7 +4,7 @@ import { spawnSync } from 'node:child_process';
 // resolves the package script's `node` to a different installed version.
 const node = process.env.npm_node_execpath || process.execPath;
 for (const args of [
-  ['--experimental-strip-types', '--test', 'tests/snake.test.mjs', 'tests/api.test.mjs'],
+  ['--experimental-strip-types', '--test', 'tests/snake.test.mjs', 'tests/api.test.mjs', 'tests/player.test.mjs'],
   ['node_modules/typescript/bin/tsc', '--noEmit'],
   ['node_modules/eslint/bin/eslint.js', '.', '--max-warnings', '0'],
   ['scripts/run-framework.mjs', 'build'],
