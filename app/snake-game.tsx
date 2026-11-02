@@ -3,11 +3,13 @@
 import { useCallback, useEffect, useEffectEvent, useRef, useState } from "react";
 import { ArrowUp, ArrowDown, ArrowLeft, ArrowRight, Play, Pause, Volume2, VolumeX, Trophy, RotateCcw, ChevronRight, Signal, BatteryFull } from "lucide-react";
 import Link from "next/link";
+import PlayerSelect from "./player-select";
+import type { Player } from "@/lib/player-session";
 import { RadioGroup, RadioGroupItem } from "@/components/ui/radio-group";
 import { LEVELS, newGame, step, interval, canTurn, type Difficulty, type Direction, type Game, type Turn } from "@/lib/snake";
 
 type Status="ready"|"starting"|"playing"|"paused"|"over";
-type Run={id:string;difficulty:Difficulty;score:number;length:number;duration_ms:number;created_at:number;status:string};
+type Run={player_name:string;id:string;difficulty:Difficulty;score:number;length:number;duration_ms:number;created_at:number;status:string};
 type Stats={played:number;best:number;food:number;recent:Run[];top:Run[]};
 const zero:Stats={played:0,best:0,food:0,recent:[],top:[]};
 const fmt=(n:number)=>String(n).padStart(3,"0");
@@ -18,12 +20,18 @@ export default function SnakeGame(){
  const [game,setGame]=useState<Game>(()=>newGame(97));
  const [status,setStatus]=useState<Status>("ready");
  const [stats,setStats]=useState<Stats>(zero);
+ const [globalBest,setGlobalBest]=useState(0);
  const [loading,setLoading]=useState(true);
  const [error,setError]=useState("");
  const [saveState,setSaveState]=useState("");
  const [savePending,setSavePending]=useState(false);
  const [sound,setSound]=useState(false);
  const [history,setHistory]=useState(false);
+ const [player,setPlayer]=useState<Player|null>(null);
+ const [personal,setPersonal]=useState(false);
+ const [identityBusy,setIdentityBusy]=useState(false);
+ const identityBusyRef=useRef(false), identityTouched=useRef(false);
+ const personalRef=useRef(false), statsRequest=useRef(0);
  const canvas=useRef<HTMLCanvasElement>(null);
  const gameRef=useRef(game), statusRef=useRef(status), levelRef=useRef(level), pending=useRef<Direction[]>([]), turns=useRef<Turn[]>([]), runId=useRef("");
  const audio=useRef<AudioContext|null>(null), soundRef=useRef(sound);
@@ -34,18 +42,27 @@ export default function SnakeGame(){
   if(!soundRef.current)return;
   try{const ctx=audio.current??new AudioContext();audio.current=ctx;void ctx.resume();const osc=ctx.createOscillator(),gain=ctx.createGain();osc.type="square";osc.frequency.value=end?110:660;gain.gain.setValueAtTime(.025,ctx.currentTime);gain.gain.exponentialRampToValueAtTime(.001,ctx.currentTime+.1);osc.connect(gain);gain.connect(ctx.destination);osc.start();osc.stop(ctx.currentTime+.11);}catch{}
  }
- function loadStats(){return fetch("/api/games",{cache:"no-store"}).then(async r=>{if(!r.ok)throw Error();return await r.json() as Stats;}).then(data=>{setStats(data);setError("");}).catch(()=>{setError("Scores are unavailable. Try reconnecting.");}).finally(()=>setLoading(false));}
+ function loadStats(mine=personalRef.current){const request=++statsRequest.current;return fetch(mine?"/api/games?scope=mine":"/api/games",{cache:"no-store"}).then(async r=>{if(!r.ok)throw Error();return await r.json() as Stats;}).then(data=>{if(request===statsRequest.current){setStats(data);setGlobalBest(best=>mine?Math.max(best,data.best):data.best);setError("");}}).catch(()=>{if(request===statsRequest.current)setError("Scores are unavailable. Try reconnecting.");}).finally(()=>{if(request===statsRequest.current)setLoading(false);});}
+ function choosePlayer(next:Player|null,initial=false){
+  if(initial&&identityTouched.current)return;
+  // Ignore the initial session response if a run started while it was loading.
+  if(statusRef.current==="playing"||statusRef.current==="starting"||statusRef.current==="paused"||savePayload.current)return;
+  identityTouched.current=true;setPlayer(next);personalRef.current=false;setPersonal(false);void loadStats(false);
+ }
+ function changeIdentityBusy(busy:boolean){identityBusyRef.current=busy;setIdentityBusy(busy);}
+ function changeScope(mine:boolean){personalRef.current=mine;setPersonal(mine);setLoading(true);void loadStats(mine);}
+
  async function save(){
   if(!savePayload.current)return;
   setSaveState("Saving your game…");
   try{const r=await fetch("/api/games",{method:"PUT",headers:{"Content-Type":"application/json"},body:JSON.stringify(savePayload.current)});if(!r.ok)throw Error();savePayload.current=null;setSavePending(false);setSaveState("Game saved");void loadStats();}catch{setSaveState("Couldn’t save. Your game is here — retry below.");}
  }
  async function start(){
-  if(["playing","paused","starting"].includes(statusRef.current)||savePayload.current)return;
-  updateStatus("starting");setError("");setSaveState("");
+  if(["playing","paused","starting"].includes(statusRef.current)||savePayload.current||identityBusyRef.current)return;
+  identityTouched.current=true;updateStatus("starting");setError("");setSaveState("");
   try{
    const r=await fetch("/api/games",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({difficulty:levelRef.current})});if(!r.ok)throw Error();
-   const data=await r.json() as {id:string;seed:number};runId.current=data.id;turns.current=[];pending.current=[];updateGame(newGame(data.seed));updateStatus("playing");void loadStats();
+   const data=await r.json() as {id:string;seed:number;player:Player};setPlayer(data.player);runId.current=data.id;turns.current=[];pending.current=[];updateGame(newGame(data.seed));updateStatus("playing");void loadStats();
   }catch{setError("Couldn’t start a saved game. Please try again.");updateStatus("ready");}
  }
  const pause=useCallback(()=>{if(statusRef.current==="playing")updateStatus("paused");else if(statusRef.current==="paused")updateStatus("playing");},[]);
@@ -112,9 +129,9 @@ export default function SnakeGame(){
      <div className="console-top"><span className="console-label">SNAKE / 97</span><div className="speaker" aria-hidden="true"/><span className="model">MONOCHROME SERIES</span></div>
      <div className="screen-bezel"><div className="lcd">
       <div className="lcd-top"><span><Signal size={18}/> {LEVELS[level].label.toUpperCase()}</span><span>{status==="paused"?"PAUSED":"SNAKE"} <BatteryFull size={24}/></span></div>
-      <div className="score-strip"><div><small>SCORE</small><strong>{fmt(score)}</strong></div><div><small>GLOBAL BEST</small><strong>{fmt(stats.best)}</strong></div></div>
+      <div className="score-strip"><div><small>SCORE</small><strong>{fmt(score)}</strong></div><div><small>GLOBAL BEST</small><strong>{fmt(globalBest)}</strong></div></div>
       <div className="board"><canvas ref={canvas} width={560} height={440} aria-label={`Snake game board. Score ${score}, length ${game.snake.length}. Use WASD or arrow keys.`}/>
-       {status!=="playing"&&<div className={`game-overlay ${status==="ready"||status==="starting"?"start-overlay":""}`}><span className="pixel-food" aria-hidden="true">✣</span><h2>{status==="ready"||status==="starting"?"SNAKE":status==="paused"?"PAUSED":game.won?"YOU WIN!":"GAME OVER"}</h2><p>{status==="ready"?"The original time killer.":status==="starting"?"Waking up the pixels…":status==="paused"?"Take a breath. We’ll wait.":`${fmt(score)} POINTS · ${game.snake.length} PIXELS LONG`}</p><button className="lcd-button" disabled={status==="starting"||savePending} onClick={()=>status==="paused"?pause():void start()}><Play size={16} fill="currentColor"/>{status==="starting"?"STARTING…":status==="paused"?"RESUME":status==="over"?"PLAY AGAIN":"START GAME"}</button><small aria-live="polite">{status==="over"?saveState:"or press SPACE"}</small>{status==="over"&&saveState.startsWith("Couldn’t")&&<button className="retry-save" onClick={()=>void save()}>Retry saving</button>}</div>}
+       {status!=="playing"&&<div className={`game-overlay ${status==="ready"||status==="starting"?"start-overlay":""}`}><span className="pixel-food" aria-hidden="true">✣</span><h2>{status==="ready"||status==="starting"?"SNAKE":status==="paused"?"PAUSED":game.won?"YOU WIN!":"GAME OVER"}</h2><p>{status==="ready"?"The original time killer.":status==="starting"?"Waking up the pixels…":status==="paused"?"Take a breath. We’ll wait.":`${fmt(score)} POINTS · ${game.snake.length} PIXELS LONG`}</p><button className="lcd-button" disabled={status==="starting"||savePending||identityBusy} onClick={()=>status==="paused"?pause():void start()}><Play size={16} fill="currentColor"/>{status==="starting"?"STARTING…":status==="paused"?"RESUME":status==="over"?"PLAY AGAIN":"START GAME"}</button><small aria-live="polite">{status==="over"?saveState:"or press SPACE"}</small>{status==="over"&&saveState.startsWith("Couldn’t")&&<button className="retry-save" onClick={()=>void save()}>Retry saving</button>}</div>}
       </div>
       <div className="lcd-bottom"><span>LENGTH {String(game.snake.length).padStart(2,"0")}</span><span>SPEED {(LEVELS[level].start/interval(level,game.eaten)).toFixed(2)}×</span><span>{clock(game.elapsed)}</span></div>
      </div></div>
@@ -122,8 +139,9 @@ export default function SnakeGame(){
    <div className="touch-controls" aria-label="Touch controls">{(["up","left","down","right"] as Direction[]).map((d,i)=>{const Icon=[ArrowUp,ArrowLeft,ArrowDown,ArrowRight][i];return <button key={d} aria-label={`Move ${d}`} className={`direction-${d}`} onPointerDown={e=>{e.preventDefault();direction(d);}}><Icon/></button>;})}</div>
     </section>
     <aside className="side-panel">
+     <PlayerSelect player={player} disabled={active||savePending} onChange={choosePlayer} onBusyChange={changeIdentityBusy}/>
      <section className="difficulty"><div className="section-heading"><span className="section-number">01</span><h2>Pick your pace</h2></div><RadioGroup className="difficulty-options" value={level} disabled={active||savePending} onValueChange={v=>{levelRef.current=v as Difficulty;setLevel(v as Difficulty);updateGame(newGame(97));updateStatus("ready");setSaveState("");}} aria-label="Difficulty">{(Object.keys(LEVELS) as Difficulty[]).map((l,i)=><label key={l} className={`level-option ${level===l?"selected":""}`}><RadioGroupItem value={l} id={`level-${l}`}/><div><strong>{LEVELS[l].label}</strong><span>{LEVELS[l].hint}</span></div><span className="pace-bars" aria-hidden="true">{[0,1,2].map(n=><i key={n} className={n<=i?"lit":""}/>)}</span></label>)}</RadioGroup><p className="pace-note">{active?"Finish this game to change difficulty.":"Every bite makes it a little faster."}</p></section>
-     <section className="records"><div className="section-heading"><span className="section-number">02</span><h2>Global records</h2><Trophy size={17}/></div><div className="stat-pair"><div><span>GLOBAL BEST</span><strong>{loading?"—":fmt(stats.best)}</strong><small>points</small></div><div><span>GLOBAL STARTS</span><strong>{loading?"—":String(stats.played).padStart(2,"0")}</strong><small>all visitors</small></div></div><div className="record-list-heading"><h3>{history?"Recent games":"Top scores"}</h3><button onClick={()=>setHistory(!history)}>{history?"Top scores":"History"}<ChevronRight size={14}/></button></div><div className="record-list">{loading?<p className="empty-records">Loading global scores…</p>:visible.length?visible.map((run,i)=><div className="record-row" key={run.id}><span className="rank">{String(i+1).padStart(2,"0")}</span><div><strong>{LEVELS[run.difficulty].label}</strong><small>{run.status==="started"?"Unfinished":`${run.length} long · ${clock(run.duration_ms)}`}</small></div><b>{run.status==="started"?"—":fmt(run.score)}</b></div>):<div className="empty-records"><Trophy size={24}/><p>The leaderboard is waiting.</p><span>Play a round to add a score.</span></div>}</div>{error?<p className="error" role="alert">{error} <button onClick={()=>void loadStats()}>Retry</button></p>:<p className="saved-note">{loading?"Connecting to global scores…":"Shared by all players. Scores saved globally."}</p>}</section>
+     <section className="records"><div className="section-heading"><span className="section-number">02</span><h2>{personal?"My records":"Global records"}</h2><Trophy size={17}/></div><div className="record-scope" aria-label="Record scope"><button aria-pressed={!personal} onClick={()=>changeScope(false)}>Global scores</button><button disabled={!player} aria-pressed={personal} onClick={()=>changeScope(true)}>My records</button></div><div className="stat-pair"><div><span>{personal?"PERSONAL BEST":"GLOBAL BEST"}</span><strong>{loading?"—":fmt(stats.best)}</strong><small>points</small></div><div><span>{personal?"YOUR STARTS":"GLOBAL STARTS"}</span><strong>{loading?"—":String(stats.played).padStart(2,"0")}</strong><small>{personal?player?.username:"all visitors"}</small></div></div><div className="record-list-heading"><h3>{history?"Recent games":"Top scores"}</h3><button onClick={()=>setHistory(!history)}>{history?"Top scores":"History"}<ChevronRight size={14}/></button></div><div className="record-list">{loading?<p className="empty-records">Loading scores…</p>:visible.length?visible.map((run,i)=><div className="record-row" key={run.id}><span className="rank">{String(i+1).padStart(2,"0")}</span><div><strong>{run.player_name}</strong><small>{LEVELS[run.difficulty].label} · {run.status==="started"?"Unfinished":`${run.length} long · ${clock(run.duration_ms)}`}</small></div><b>{run.status==="started"?"—":fmt(run.score)}</b></div>):<div className="empty-records"><Trophy size={24}/><p>The leaderboard is waiting.</p><span>Play a round to add a score.</span></div>}</div>{error?<p className="error" role="alert">{error} <button onClick={()=>void loadStats()}>Retry</button></p>:<p className="saved-note">{loading?"Connecting to scores…":(personal?"Records for this player.":"Shared by all players. Scores saved globally.")}</p>}</section>
     </aside>
    </div>
    <section className="instructions" aria-label="How to play"><div className="instructions-title"><span className="section-number">03</span><h2>Muscle memory,<br/>meet keyboard.</h2></div><div className="key-instruction"><div className="key-cluster"><kbd>W</kbd><div><kbd>A</kbd><kbd>S</kbd><kbd>D</kbd></div></div><span>or</span><div className="key-cluster"><kbd>↑</kbd><div><kbd>←</kbd><kbd>↓</kbd><kbd>→</kbd></div></div><p>Move your snake</p></div><div className="rule"><span className="food-icon">✣</span><p>Eat. Grow. Repeat.<small>More bites. More points. More speed.</small></p></div><div className="rule"><RotateCcw size={22}/><p>Watch your head.<small>A wall or your own tail ends the game.</small></p></div></section>

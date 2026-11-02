@@ -1,6 +1,7 @@
 import { z } from "zod";
 import { LEVELS, newGame, step, type Difficulty } from "./snake.ts";
 import { limitWrite } from "./rate-limit.ts";
+import { currentPlayer, guestSession } from "./player-session.ts";
 
 
 const json=(body:unknown,status=200)=>Response.json(body,{status,headers:{"Cache-Control":"no-store"}});
@@ -15,13 +16,19 @@ function sameOrigin(req:Request){const origin=req.headers.get("origin");return !
 function failure(error:unknown){console.error("Score database request failed",error);return json({error:"Scores are temporarily unavailable. Please retry."},503);}
 
 export function createGameApi(getSql: () => D1Database) {
-async function GET(){
+async function GET(req?:Request){
   try{
     const db=getSql();
+    const mine=!!req&&new URL(req.url).searchParams.get("scope")==="mine";
+    const player=mine?await currentPlayer(db,req!):null;
+    if(mine&&!player)return json({error:"Choose a player before viewing personal records."},401);
+    const where=mine?" WHERE player_id = ?":"";
+    const query=(sql:string)=>{const statement=db.prepare(sql);return mine?statement.bind(player!.id):statement;};
+    const columns="id, difficulty, score, length, duration_ms, created_at, status, player_name";
     const results=await db.batch([
-      db.prepare("SELECT COUNT(*) AS played, COALESCE(MAX(score), 0) AS best, COALESCE(SUM(food), 0) AS food FROM games"),
-      db.prepare("SELECT id, difficulty, score, length, duration_ms, created_at, status FROM games ORDER BY created_at DESC LIMIT 5"),
-      db.prepare("SELECT id, difficulty, score, length, duration_ms, created_at, status FROM games WHERE status = 'completed' ORDER BY score DESC, created_at DESC LIMIT 5")
+      query("SELECT COUNT(*) AS played, COALESCE(MAX(score), 0) AS best, COALESCE(SUM(food), 0) AS food FROM games"+where),
+      query(`SELECT ${columns} FROM games${where} ORDER BY created_at DESC, id DESC LIMIT 5`),
+      query(`SELECT ${columns} FROM games${where}${mine?" AND":" WHERE"} status = 'completed' ORDER BY score DESC, created_at DESC, id DESC LIMIT 5`)
     ]);
     return json({...results[0].results[0] as Record<string,number>,recent:results[1].results,top:results[2].results});
   }catch(e){return failure(e);}
@@ -34,8 +41,12 @@ async function POST(req:Request){
   try{input=startSchema.parse(await body(req));}catch{return json({error:"Choose Easy, Medium, or Hard."},400);}
   try{
     const id=crypto.randomUUID(), seed=crypto.getRandomValues(new Uint32Array(1))[0];
-    await getSql().prepare("INSERT INTO games (id, seed, difficulty, status, score, length, food, duration_ms, created_at) VALUES (?, ?, ?, 'started', 0, 4, 0, 0, ?)").bind(id,seed,input.difficulty,Date.now()).run();
-    return json({id,seed,difficulty:input.difficulty},201);
+    const db=getSql();
+    const session=await guestSession(db,req);
+    await db.prepare("INSERT INTO games (id, seed, difficulty, status, score, length, food, duration_ms, created_at, player_id, player_name) VALUES (?, ?, ?, 'started', 0, 4, 0, 0, ?, ?, ?)").bind(id,seed,input.difficulty,Date.now(),session.player.id,session.player.username).run();
+    const response=json({id,seed,difficulty:input.difficulty,player:session.player},201);
+    if(session.cookie)response.headers.set("Set-Cookie",session.cookie);
+    return response;
   }catch(e){return failure(e);}
 }
 
@@ -46,8 +57,10 @@ async function PUT(req:Request){
   try{input=finishSchema.parse(await body(req));}catch{return json({error:"Invalid game replay."},400);}
   try{
     const db=getSql();
-    const row=await db.prepare("SELECT seed, difficulty, status, score, created_at FROM games WHERE id = ?").bind(input.id).first<{seed:number;difficulty:Difficulty;status:string;score:number;created_at:number}>();
+    const row=await db.prepare("SELECT seed, difficulty, status, score, created_at, player_id FROM games WHERE id = ?").bind(input.id).first<{seed:number;difficulty:Difficulty;status:string;score:number;created_at:number;player_id:string|null}>();
     if(!row)return json({error:"Game not found."},404);
+    const player=await currentPlayer(db,req);
+    if(!row.player_id||row.player_id!==player?.id)return json({error:"This run belongs to another player. Sign in as the player who started it."},403);
     if(row.status==="completed")return json({saved:true,score:row.score});
     let lastTick=0;
     for(const turn of input.turns){if(turn.tick<=lastTick||turn.tick>input.ticks)return json({error:"Invalid turn sequence."},400);lastTick=turn.tick;}

@@ -6,7 +6,7 @@
     "node": ">=22.13.0"
   },
   "scripts": {
-    "test": "node --experimental-strip-types --test tests/snake.test.mjs tests/api.test.mjs",
+    "test": "node --experimental-strip-types --test tests/snake.test.mjs tests/api.test.mjs tests/player.test.mjs",
     "typecheck": "tsc --noEmit",
     "test:browser": "playwright test",
     "verify": "node scripts/verify.mjs",

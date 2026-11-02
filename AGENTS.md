@@ -27,6 +27,7 @@ The original deployment was private and used another slug. Do not restore that o
 - Choose Easy, Medium, or Hard before starting. Difficulty changes are disabled during an active run or while a result is awaiting save.
 - Eat food to gain points, grow, and increase speed. Hit a wall or the body to lose; fill the board to win. There is no wall wrapping.
 - Display score, best score, length, relative speed, and active simulation time. Show total games started, five top completed scores, and five recent runs.
+- Optional username/password accounts coexist with immediate guest play. The PLAYER SELECT panel locks during active runs and pending saves. Record rows show server-assigned names; Global scores / My records switch scope.
 - Save automatically at game over. A failed save stays in memory and exposes Retry; another game cannot start until that save succeeds.
 
 Rules in `lib/snake.ts` are authoritative:
@@ -72,6 +73,7 @@ Preserve the lockfile and existing package manager. The starter includes more UI
 - `app/chatgpt-auth.ts`: available server-side ChatGPT identity/sign-in helpers, currently unused by the game routes.
 - `components/ui/`, `hooks/`, `vendor/`: supplied UI primitives/helpers and licensed assets. Compose primitives rather than editing vendored implementations for a one-off style change.
 - `tests/snake.test.mjs`: six engine tests. `tests/api.test.mjs`: isolated real-D1 handler tests, including races and failures. `tests/api-smoke.mjs`: local HTTP/database smoke check. `tests/browser/game.spec.ts`: desktop/phone Playwright journeys.
+- `app/player-select.tsx`: retro account/guest controls. `app/api/player/route.ts`, `lib/player-api.ts`, `lib/player-session.ts`: registration/login/logout, password hashing and opaque sessions. `tests/player.test.mjs`: auth and ownership coverage.
 - `lib/rate-limit.ts`: shared D1 write budgets. `scripts/verify.mjs`: full verification. `scripts/e2e-server.mjs`: fresh migrated browser-test storage on port 4173.
 - `examples/d1/`: starter examples, not live routes; excluded from TypeScript checking. Do not modify these instead of the real application.
 - `README.md`: human-facing play, setup and verification guide.
@@ -82,27 +84,41 @@ Client status is `ready | starting | playing | paused | over`. Refs provide curr
 
 The run lifecycle:
 
-1. `POST /api/games` accepts exactly `{ "difficulty": "easy" | "medium" | "hard" }`. The server generates a UUID and unsigned random 32-bit seed, inserts a `started` row, and returns `{ id, seed, difficulty }` with HTTP 201.
+1. `POST /api/games` accepts exactly `{ "difficulty": "easy" | "medium" | "hard" }`. The server resolves the player cookie or creates a guest session, generates a UUID and unsigned random 32-bit seed, inserts a `started` row with `player_id` and `player_name`, and returns `{ id, seed, difficulty, player }` with HTTP 201.
 2. The browser initializes from that seed and simulates locally. It logs consumed turns as `{ tick, direction }`, with one-based tick numbers. No per-tick network request is made.
 3. On collision or victory, `PUT /api/games` sends exactly `{ id, ticks, turns }`. Do not submit a score or trust a client-calculated score.
-4. The server loads the original seed and difficulty, replays the run with the same engine, verifies its end, calculates score/length/food/duration, and updates the row to `completed`.
+4. The server verifies the session owns this run (including duplicate completion requests), loads the original seed and difficulty, replays the run with the same engine, verifies its end, calculates score/length/food/duration, and updates the row to `completed`.
 5. After the conditional update, the handler reads the canonical stored result; losing concurrent requests return the winning score. A repeat completion request for an already completed ID returns the saved score without inserting another row. UI reloads statistics after successful completion.
 
-`GET /api/games` returns `{ played, best, food, recent, top }`. `played` counts **all started rows**, including abandoned runs. `best` is the maximum stored score across difficulties; `food` sums stored food. `recent` returns the five newest starts; `top` returns five completed runs ordered by score descending, then creation time descending. Returned run fields are `id`, `difficulty`, `score`, `length`, `duration_ms`, `created_at`, and `status`.
+`GET /api/games` returns `{ played, best, food, recent, top }`. `played` counts **all started rows**, including abandoned runs. `best` is the maximum stored score across difficulties; `food` sums stored food. `recent` returns the five newest starts; `top` returns five completed runs ordered by score descending, then creation time descending. Returned run fields include `player_name`, `id`, `difficulty`, `score`, `length`, `duration_ms`, `created_at`, and `status`.
 
 Validation and errors:
 
-- Invalid input/replay: 400; mismatched supplied Origin: 403; unknown completion ID: 404; rate limit: 429 (with `Retry-After`); database failure: 503; successful read/save: 200.
+- Invalid input/replay: 400; missing personal-record session: 401; run ownership mismatch: 403; mismatched supplied Origin: 403; unknown completion ID: 404; rate limit: 429 (with `Retry-After`); database failure: 503; successful read/save: 200.
 - The route checks a supplied Origin against the request URL origin, but permits requests with no Origin. This is not authentication. Separate D1 write limits apply before parsing/replay: 12 starts and 30 submissions per 60-second fixed window per trusted `CF-Connecting-IP`. Missing headers share one fallback budget. Digests rotate each window; raw addresses are not stored. Expired counters are removed on writes. D1 UPSERTs enforce budgets across concurrent instances; shared networks share a budget and the limiter itself still consumes D1 operations. Cross-origin frontend hosting is not currently configured.
 - Request text is capped at **1,000,000 characters after reading it**. Replay permits **100,000 ticks** and **20,000 turns**; turn ticks must strictly increase and cannot exceed the final tick.
 - Replays must end exactly at game over; continuing after game over or submitting an unfinished run is rejected. Simulated time cannot exceed time since server-side creation by more than **1,500 ms**.
 - Zod schemas reject extra fields. Database errors are logged server-side, while responses give a recoverable generic message.
 
-The `games` table has ten columns: `id` (text primary key), `seed`, `difficulty`, `status`, `score` (default 0), `length` (default 4), `food` (default 0), `duration_ms` (default 0), `created_at`, and nullable `completed_at`. Timestamps are epoch milliseconds. Indexes cover `created_at` and `(status, score, created_at)`.
+The `games` table has twelve columns, including nullable `player_id` (a foreign key to `players`) and `player_name` (a start-time snapshot, default `LEGACY` for pre-account records), plus: `id` (text primary key), `seed`, `difficulty`, `status`, `score` (default 0), `length` (default 4), `food` (default 0), `duration_ms` (default 0), `created_at`, and nullable `completed_at`. Timestamps are epoch milliseconds. Indexes cover `created_at`, `(status, score, created_at)`, and `(player_id, created_at)`.
 
 The separate `rate_limits` table stores `key`, `window_start`, and `count`, with an index on `window_start`. Migration `0001_bouncy_banshee.sql` adds it without changing game records.
 
-There is no user ID column, persisted turn log, account system, deletion API, pagination, or ongoing-run recovery. Finished game summaries are durable; active gameplay and unsaved replays are not.
+There is no persisted turn log, player-deletion API, pagination, password recovery, or ongoing-run recovery. Finished game summaries are durable; active gameplay and unsaved replays are not.
+
+## Player identity and ownership
+
+`GET /api/player` returns `{ player: null | { id, username, guest } }`. `POST /api/player` accepts exactly `{ action: "register" | "login", username, password }`; registration returns 201, login 200, duplicate username 409, invalid credentials 401, invalid input 400. `DELETE /api/player` revokes the current session and expires its cookie. Authentication writes reject cross-site requests and mismatched supplied Origin; POST requires JSON and a streamed 4096-byte maximum body.
+
+Account usernames are 3–16 ASCII letters, digits or underscores, trimmed and unique case-insensitively through `username_key`; `guest` and `legacy` are reserved. Password registration requires 15–128 characters with spaces allowed. Salted scrypt uses `N=16384, r=8, p=5` and a versioned hash, native `node:crypto`, and constant-time comparison. Unknown usernames perform dummy hashing. No email, password recovery or four-digit PIN authentication is provided. Benchmark hashing against the target host's CPU limits before production deployment; local and CI Worker checks do not prove hosted CPU entitlement.
+
+`players` stores `id`, display `username`, nullable unique `username_key`, nullable `password_hash`, and `created_at`. Guest rows have no username key or password. `player_sessions` stores only a SHA-256 token digest, player FK, and expiry; indexes cover player and expiry. Tokens are random 256-bit values in 30-day HttpOnly SameSite=Lax cookies. HTTPS uses `__Host-snake97; Secure; Path=/`; loopback HTTP uses `snake97_session`. Login/registration rotate the current token; logout revokes it. Expired session rows are removed when issuing a session. Credentials and session tokens must never be logged or persisted in browser storage.
+
+New runs resolve their identity on the server. The client cannot submit a player name or owner. Completion checks ownership before both replay and idempotent responses. Legacy completed records remain globally visible with `LEGACY`; pre-account unfinished runs have no recoverable owner and cannot now be completed. Guest records are tied to their browser session, and are not transferred when creating or signing into an account. Existing shared records are never claimed. Session expiry, cookie clearing or guest sign-out loses guest access; recorded summaries stay in global history.
+
+`GET /api/games?scope=mine` filters all aggregates, recent rows and top rows together by the session's player ID; it returns 401 without a session. Default GET stays global. Both guest and account sessions can access their own view. Per-minute auth limits are 10 requests per trusted client address, 3 registrations per address, and 5 login attempts per normalized username across addresses, in addition to the existing start/submit budgets.
+
+Migration `0002_purple_ironclad.sql` adds the identity tables and nullable game ownership/name fields. Keep published migrations immutable and apply pending migrations in order. Test fixtures default to `LEGACY` and are not attributed to real accounts.
 
 ## Local setup and configuration
 
@@ -120,6 +136,7 @@ Before the first local database use, apply the initial migration **once**:
 ```sh
 node --import ./scripts/sites-env.mjs ./node_modules/wrangler/bin/wrangler.js d1 execute DB --local --config dist/server/wrangler.json --persist-to .wrangler/state --file drizzle/0000_loud_santa_claus.sql
 node --import ./scripts/sites-env.mjs ./node_modules/wrangler/bin/wrangler.js d1 execute DB --local --config dist/server/wrangler.json --persist-to .wrangler/state --file drizzle/0001_bouncy_banshee.sql
+node --import ./scripts/sites-env.mjs ./node_modules/wrangler/bin/wrangler.js d1 execute DB --local --config dist/server/wrangler.json --persist-to .wrangler/state --file drizzle/0002_purple_ironclad.sql
 npm run dev
 ```
 
@@ -166,9 +183,9 @@ With a running local server and migrated D1 database:
 node --experimental-strip-types tests/api-smoke.mjs
 ```
 
-`npm run verify` runs engine/API tests, type checking, zero-warning linting, build, and Playwright. GitHub Actions uses the same command. `npm test`, `npm run typecheck`, `npm run lint`, and `npm run test:browser` are available separately; browser tests require a current build. The API suite creates an in-memory Miniflare D1 database and applies every migration. Browser tests start a built Worker on port 4173 with fresh storage under ignored `.wrangler/e2e/`, leaving development state intact; databases remain there for inspection. Traces are retained on failure.
+`npm run verify` runs engine/API tests, type checking, zero-warning linting, build, and Playwright. GitHub Actions uses the same command. `npm test`, `npm run typecheck`, `npm run lint`, and `npm run test:browser` are available separately; browser tests require a current build. The API suite creates an in-memory Miniflare D1 database and applies every migration. Browser tests copy the built artifact into each fresh `.wrangler/e2e/` run directory before starting its Worker on port 4173, leaving development state intact; databases remain there for inspection. Traces are retained on failure.
 
-Engine tests cover seeded food, growth and immutable previous state, speed changes/caps, reverse-turn rejection, wall/body collision, legal tail-cell movement, and board-fill victory. The API smoke test creates one real **local** run and checks invalid difficulty, a food-eating replay, rejection of score tampering and unfinished replay, persistence, duplicate completion, and statistics. It waits for simulation duration before saving. It defaults to `http://localhost:5173`; `SNAKE_TEST_URL` can change the URL but the script rejects non-localhost/non-127.0.0.1 hosts. It allows concurrent starts and verifies its exact persisted score through idempotent completion rather than leaderboard membership. The browser suite runs it with five higher fixture scores already stored. API tests additionally cover unknown IDs, validation caps, turn ordering, post-game ticks, database failures/write recovery, conflicting concurrent completions, and concurrent rate budgets. Browser journeys exercise controls, pause/resume, focus loss, save/retry, persistence and responsive layout on desktop and phone.
+Engine tests cover seeded food, growth and immutable previous state, speed changes/caps, reverse-turn rejection, wall/body collision, legal tail-cell movement, and board-fill victory. The API smoke test creates one real **local** run and checks invalid difficulty, a food-eating replay, rejection of score tampering and unfinished replay, persistence, duplicate completion, and statistics. It waits for simulation duration before saving. It defaults to `http://localhost:5173`; `SNAKE_TEST_URL` can change the URL but the script rejects non-localhost/non-127.0.0.1 hosts. It allows concurrent starts and verifies its exact persisted score through idempotent completion rather than leaderboard membership. The browser suite runs it with five higher fixture scores already stored. Account tests cover hashing, username uniqueness races, login/session expiry and revocation, throttling, guest/legacy separation, cross-device history and ownership. Migration tests verify that pre-account records retain scores/timestamps and become unowned LEGACY rows. API tests additionally cover unknown IDs, validation caps, turn ordering, post-game ticks, database failures/write recovery, conflicting concurrent completions, and concurrent rate budgets. Browser journeys exercise registration, sign-in/out, named personal records, controls, pause/resume, focus loss, save/retry, persistence and responsive layout on desktop and phone.
 
 For gameplay/UI changes, also check start, WASD and arrows, pause/resume, focus-loss pause, difficulty locking, game-over save, failed-save retry, and score history after reload. Check desktop and phone widths (for example 1440 px and 390 px), visible touch controls, focus indicators and reduced motion. Do not run write tests against production by replacing the smoke test's hostname guard. Documentation-only changes need document/path/config verification, not an app deployment or a new game test run.
 
@@ -207,9 +224,9 @@ A failed deployment can have applied migrations before Worker upload failed. Det
 ## Sharing, portability and limitations
 
 - The game is currently public. Sharing permissions only control who can visit; they do not create player ownership inside the application.
-- **All visitors share one database history, best score and games-played count.** The UI labels records, best score, and starts as global. There are no player names, player-specific records or authenticated write checks in the game route.
-- Replay validation prevents simply submitting an arbitrary score, but does not prevent bots or prove a person played. Basic per-address D1 write limits apply; there is no edge-level flood protection. An unknown client can call the public API; Origin validation and random run IDs are not substitutes for authorization.
-- For work adding individual records, use a stable server-verified identity and ownership checks, migrate existing shared records deliberately, and update read/write queries together. Existing `app/chatgpt-auth.ts` helpers are not already wired into this flow.
+- **The default records view is global.** Optional accounts and browser guests have server-owned named runs and a separate personal records view. The server checks completion ownership; replay validation remains authoritative for scores.
+- Replay validation prevents simply submitting an arbitrary score, but does not prevent bots or prove a person played. Basic per-address D1 write limits apply; there is no edge-level flood protection. An unknown client can start guest runs through the public API; completion requires the owning session. Origin validation and random run IDs do not replace that ownership check.
+- Player accounts use the local player/session tables; the existing `app/chatgpt-auth.ts` helpers remain separate and unused. Do not mix the two identities or claim legacy scores automatically.
 - Sites owns `/signin-with-chatgpt`, `/signout-with-chatgpt`, and `/callback`. The portable preview plugin can mock sign-in on loopback for a fixed local user; that is not production identity or authorization. Do not import the server auth helper into the client bundle or implement replacement reserved routes casually.
 - There is no offline mode. Starting requires a successful server insert. Closing/reloading loses a pending replay; its started database row remains unfinished. There is no abandonment cleanup or resumed-game endpoint.
 - Replay caps are enforced on the server but not as an explicit frontend game limit. Very long runs can exceed those caps and fail saving; budget any future changes against server CPU/memory and the host's actual limits.

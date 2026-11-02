@@ -1,4 +1,4 @@
-import { mkdtempSync, mkdirSync, readdirSync } from 'node:fs';
+import { cpSync, mkdtempSync, mkdirSync, readdirSync } from 'node:fs';
 import path from 'node:path';
 import { spawn, spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
@@ -8,9 +8,13 @@ import './sites-env.mjs';
 const root = fileURLToPath(new URL('../', import.meta.url));
 mkdirSync(path.join(root, '.wrangler/e2e'), {recursive: true});
 const state = mkdtempSync(path.join(root, '.wrangler/e2e/run-'));
+// Freeze the validated build so source edits or background file sync cannot
+// restart the preview in the middle of a browser request.
+const artifact = path.join(state, 'artifact');
+cpSync(path.join(root, 'dist'), artifact, {recursive: true});
 const cli = path.join(root, 'node_modules/wrangler/bin/wrangler.js');
 const node = process.env.npm_node_execpath || process.execPath;
-const common = ['--local', '--config', 'dist/server/wrangler.json', '--persist-to', state];
+const common = ['--local', '--config', path.join(artifact, 'server/wrangler.json'), '--persist-to', state];
 function execute(args) {
   const result = spawnSync(node, ['--import', './scripts/sites-env.mjs', cli, 'd1', 'execute', 'DB', ...common, ...args], {stdio: 'inherit'});
   if (result.error) throw result.error;
