@@ -20,5 +20,9 @@ assert.equal((await request('PUT',{id:run.id,ticks:1,turns:[]})).status,400);
 await new Promise(resolve=>setTimeout(resolve,game.elapsed));
 const finish=await request('PUT',payload);assert.equal(finish.status,200);assert.equal((await finish.json()).score,game.eaten*LEVELS.easy.points);
 assert.equal((await request('PUT',payload)).status,200);
-const after=await(await request('GET')).json();assert.equal(after.played,before.played+1);assert.ok(after.top.some(r=>r.id===run.id));
+const after=await(await request('GET')).json();assert.ok(after.played>=before.played+1);
+// Idempotent completion reads this exact persisted run, independent of rank or
+// other visitors pushing it out of the recent/top five lists.
+const persisted=await request('PUT',payload);assert.equal(persisted.status,200);
+assert.deepEqual(await persisted.json(),{saved:true,score:game.eaten*LEVELS.easy.points});
 console.log(JSON.stringify({result:'PASS',checks:['invalid difficulty','growth replay','score tampering rejected','unfinished replay rejected','saved score','idempotent finish','persistent history'],id:run.id,score:game.eaten*10}));
